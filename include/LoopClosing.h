@@ -33,6 +33,8 @@
 #include <mutex>
 #include "Thirdparty/g2o/g2o/types/types_seven_dof_expmap.h"
 
+#include "IMU/configparam.h"
+
 namespace ORB_SLAM2
 {
 
@@ -43,6 +45,16 @@ class KeyFrameDatabase;
 
 class LoopClosing
 {
+public:
+    ConfigParam* mpParams;
+
+    bool GetMapUpdateFlagForTracking();
+    void SetMapUpdateFlagInTracking(bool bflag);
+
+protected:
+    std::mutex mMutexMapUpdateFlag;
+    bool mbMapUpdateFlagForTracking;
+
 public:
 
     typedef pair<set<KeyFrame*>,int> ConsistentGroup;    

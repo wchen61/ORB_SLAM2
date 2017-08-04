@@ -43,6 +43,325 @@ using namespace std;
 namespace ORB_SLAM2
 {
 
+void Tracking::RecomputeIMUBiasAndCurrentNavstate(NavState &nscur) {
+    size_t N = mv20FramesReloc.size();
+    
+    if (N!=20)
+        cerr << "Frame vector size is not 20 to compute bias, size:" << mv20FramesReloc.size() << endl;
+
+    Vector3d bg = Optimizer::OptimizeInitialGyroBias(mv20FramesReloc);
+
+    for (size_t i = 0; i < N; i++) {
+        Frame& frame = mv20FramesReloc[i];
+        if (frame.GetNavState().Get_BiasGyr().norm() != 0
+            || frame.GetNavState().Get_dBias_Gyr().norm() != 0)
+            cerr << "Frame " << frame.mnId << "gyr bias or delta bias not zero???" << endl;
+        
+        frame.SetNavStateBiasGyr(bg);
+    }
+
+    vector<IMUPreintegrator> v19IMUPreint;
+    v19IMUPreint.reserve(20-1);
+    for (size_t i = 0; i < N; i++) {
+        if ( i == 0)
+            continue;
+
+        const Frame& Fi = mv20FramesReloc[i-1];
+        const Frame& Fj = mv20FramesReloc[i];
+        IMUPreintegrator imupreint;
+        Fj.ComputeIMUPreIntSinceLastFrame(&Fi, imupreint);
+        v19IMUPreint.push_back(imupreint);
+    }
+
+    cv::Mat A = cv::Mat::zeros(3*(N-2), 3, CV_32F);
+    cv::Mat B = cv::Mat::zeros(3*(N-2), 1, CV_32F);
+    const cv::Mat& gw = mpLocalMapper->GetGravityVec();
+    const cv::Mat& Tcb = ConfigParam::GetMatT_cb();
+
+    for (int i = 0; i < N-2; i++) {
+        const Frame& F1 = mv20FramesReloc[i];
+        const Frame& F2 = mv20FramesReloc[i+1];
+        const Frame& F3 = mv20FramesReloc[i+2];
+
+        const IMUPreintegrator& PreInt12 = v19IMUPreint[i];
+        const IMUPreintegrator& PreInt23 = v19IMUPreint[i+1];
+
+        double dt12 = PreInt12.getDeltaTime();
+        double dt23 = PreInt23.getDeltaTime();
+
+        cv::Mat dp12 = Converter::toCvMat(PreInt12.getDeltaP());
+        cv::Mat dv12 = Converter::toCvMat(PreInt12.getDeltaV());
+        cv::Mat dp23 = Converter::toCvMat(PreInt23.getDeltaP());
+        cv::Mat Jpba12 = Converter::toCvMat(PreInt12.getJPBiasa());
+        cv::Mat Jvba12 = Converter::toCvMat(PreInt12.getJVBiasa());
+        cv::Mat Jpba23 = Converter::toCvMat(PreInt23.getJPBiasa());
+
+        cv::Mat Twb1 = Converter::toCvMatInverse(F1.mTcw)*Tcb;
+        cv::Mat Twb2 = Converter::toCvMatInverse(F2.mTcw)*Tcb;
+        cv::Mat Twb3 = Converter::toCvMatInverse(F3.mTcw)*Tcb;
+
+        cv::Mat pb1 = Twb1.rowRange(0, 3).col(3);
+        cv::Mat pb2 = Twb2.rowRange(0, 3).col(3);
+        cv::Mat pb3 = Twb3.rowRange(0, 3).col(3);
+
+        cv::Mat Rb1 = Twb1.rowRange(0, 3).colRange(0, 3);
+        cv::Mat Rb2 = Twb2.rowRange(0, 3).colRange(0, 3);
+
+        cv::Mat Ai = Rb1*Jpba12*dt23 - Rb2*Jpba23*dt12 - Rb1*Jvba12*dt12*dt23;
+        cv::Mat Bi = (pb2-pb3)*dt12 + (pb2-pb1)*dt23 + Rb2*dp23*dt12 - Rb1*dp12*dt23 + Rb1*dv12*dt12*dt23 + 0.5*gw*(dt12*dt12*dt23 + dt12*dt23*dt23);
+        Ai.copyTo(A.rowRange(3*i, 3*i+3));
+        Bi.copyTo(B.rowRange(3*i, 3*i+3));
+
+        if (fabs(F2.mTimeStamp - F1.mTimeStamp - dt12) > 1e-6 
+                || fabs(F3.mTimeStamp - F2.mTimeStamp - dt23) > 1e-6)
+            cerr << "delta time not right." << endl;
+    }
+
+    cv::Mat w2, u2, vt2;
+
+    cv::SVDecomp(A, w2, u2, vt2, cv::SVD::MODIFY_A);
+    cv::Mat w2inv = cv::Mat::eye(3, 3, CV_32F);
+    for (int i = 0; i < 3; i++) {
+        if (fabs(w2.at<float>(i)) < 1e-10) {
+            w2.at<float>(i) += 1e-10;
+            cerr << "w2(i) < 1e-10, w=" << endl << w2 << endl;
+        }
+        w2inv.at<float>(i, i) = 1./w2.at<float>(i);
+    }
+
+    cv::Mat ba_cv = vt2.t()*w2inv*u2.t()*B;
+    Vector3d ba = Converter::toVector3d(ba_cv);
+
+    for (size_t i = 0; i < N; i++) {
+        Frame & frame = mv20FramesReloc[i];
+        if (frame.GetNavState().Get_BiasAcc().norm() != 0
+                || frame.GetNavState().Get_dBias_Gyr().norm() !=0
+                || frame.GetNavState().Get_dBias_Acc().norm() !=0)
+            cerr<<"Frame "<<frame.mnId<<" acc bias or delta bias not zero???"<<endl;
+        frame.SetNavStateBiasAcc(ba);
+    }
+
+    Vector3d Pcur;
+    Vector3d Vcur;
+    Matrix3d Rcur;
+
+    Frame& F1 = mv20FramesReloc[N-2];
+    Frame& F2 = mv20FramesReloc[N-1];
+    const IMUPreintegrator& imupreint = v19IMUPreint.back();
+    const double dt12 = imupreint.getDeltaTime();
+    const Vector3d dp12 = imupreint.getDeltaP();
+    const Vector3d gweig = Converter::toVector3d(gw);
+    const Matrix3d Jpba12 = imupreint.getJPBiasa();
+    const Vector3d dv12 = imupreint.getDeltaV();
+    const Matrix3d Jvba12 = imupreint.getJVBiasa();
+
+    cv::Mat Twb1 = Converter::toCvMatInverse(F1.mTcw)*Tcb;
+    cv::Mat Twb2 = Converter::toCvMatInverse(F2.mTcw)*Tcb;
+    Vector3d P1 = Converter::toVector3d(Twb1.rowRange(0, 3).col(3));
+    Pcur = Converter::toVector3d(Twb2.rowRange(0, 3).col(3));
+    Matrix3d R1 = Converter::toMatrix3d(Twb1.rowRange(0,3).colRange(0, 3));
+    Rcur = Converter::toMatrix3d(Twb2.rowRange(0, 3).colRange(0, 3));
+    Vector3d V1 = 1./dt12*(Pcur - P1 - 0.5*gweig*dt12*dt12 - R1*(dp12 + Jpba12*ba));
+    
+    Vcur = V1 + gweig*dt12 + R1*(dv12 + Jvba12*ba);
+
+    if(F2.mnId != mCurrentFrame.mnId)
+        cerr<<"framecur.mnId != mCurrentFrame.mnId. why??"<<endl;
+    if(fabs(F2.mTimeStamp-F1.mTimeStamp-dt12)>1e-6)
+        cerr<<"timestamp not right?? in compute vel"<<endl;
+
+    nscur.Set_Pos(Pcur);
+    nscur.Set_Vel(Vcur);
+    nscur.Set_Rot(Rcur);
+    nscur.Set_BiasGyr(bg);
+    nscur.Set_BiasAcc(ba);
+    nscur.Set_DeltaBiasGyr(Vector3d::Zero());
+    nscur.Set_DeltaBiasAcc(Vector3d::Zero());
+}
+
+bool Tracking::TrackLocalMapWithIMU(bool bMapUpdated) {
+    UpdateLocalMap();
+    SearchLocalPoints();
+
+    if (mpLocalMapper->GetFirstVINSInited() || bMapUpdated) {
+        IMUPreintegrator imupreint = GetIMUPreIntSinceLastKF(&mCurrentFrame, mpLastKeyFrame, mvIMUSinceLastKF);
+        if(mCurrentFrame.GetNavState().Get_dBias_Acc().norm() > 1e-6) cerr<<"TrackLocalMapWithIMU current Frame dBias acc not zero"<<endl;
+        if(mCurrentFrame.GetNavState().Get_dBias_Gyr().norm() > 1e-6) cerr<<"TrackLocalMapWithIMU current Frame dBias gyr not zero"<<endl;
+
+        Optimizer::PoseOptimization(&mCurrentFrame, mpLastKeyFrame, imupreint, mpLocalMapper->GetGravityVec(), true);
+    } else {
+        IMUPreintegrator imupreint = GetIMUPreIntSinceLastFrame(&mCurrentFrame, &mLastFrame);
+        Optimizer::PoseOptimization(&mCurrentFrame, &mLastFrame, imupreint, mpLocalMapper->GetGravityVec(), true);
+    }
+
+    mnMatchesInliers = 0;
+
+    for (int i = 0; i < mCurrentFrame.N; i++) {
+        if (!mCurrentFrame.mvpMapPoints[i]) {
+            if (!mCurrentFrame.mvbOutlier[i]) {
+                mCurrentFrame.mvpMapPoints[i]->IncreaseFound();
+                if (!mbOnlyTracking) {
+                    if (mCurrentFrame.mvpMapPoints[i]->Observations() > 0)
+                        mnMatchesInliers++;
+                } else {
+                    mnMatchesInliers++;
+                }
+            } else if (mSensor == System::STEREO) {
+                mCurrentFrame.mvpMapPoints[i] = static_cast<MapPoint*>(NULL);
+            }
+        }
+    }
+
+    if (mCurrentFrame.mnId < mnLastRelocFrameId + mMaxFrames && mnMatchesInliers < 50)
+        return false;
+
+    if (mnMatchesInliers < 6)
+        return false;
+    else
+        return true;
+}
+
+void Tracking::PredictNavStateByIMU(bool bMapUpdated) {
+    if (!mpLocalMapper->GetVINSInited())
+        cerr << "mpLocalMapper->GetVINSInited() not, shouldn't in PredictNavStateByIMU"<<endl;
+
+    if (mpLocalMapper->GetFirstVINSInited() || bMapUpdated) {
+        mIMUPreIntInTrack = GetIMUPreIntSinceLastKF(&mCurrentFrame, mpLastKeyFrame, mvIMUSinceLastKF);
+        mCurrentFrame.SetInitialNavStateAndBias(mpLastKeyFrame->GetNavState());
+        mCurrentFrame.UpdatePoseFromNS(ConfigParam::GetMatTbc());
+
+        // Test log
+        // Updated KF by Local Mapping. Should be the same as mpLastKeyFrame
+        if(mCurrentFrame.GetNavState().Get_dBias_Acc().norm() > 1e-6) cerr<<"PredictNavStateByIMU1 current Frame dBias acc not zero"<<endl;
+        if(mCurrentFrame.GetNavState().Get_dBias_Gyr().norm() > 1e-6) cerr<<"PredictNavStateByIMU1 current Frame dBias gyr not zero"<<endl;
+    } else {
+        mIMUPreIntInTrack = GetIMUPreIntSinceLastFrame(&mCurrentFrame, &mLastFrame);
+
+        mCurrentFrame.SetInitialNavStateAndBias(mLastFrame.GetNavState());
+        mCurrentFrame.UpdateNavState(mIMUPreIntInTrack, Converter::toVector3d(mpLocalMapper->GetGravityVec()));
+        mCurrentFrame.UpdatePoseFromNS(ConfigParam::GetMatTbc());
+
+        // Test log
+        if(mCurrentFrame.GetNavState().Get_dBias_Acc().norm() > 1e-6) cerr<<"PredictNavStateByIMU2 current Frame dBias acc not zero"<<endl;
+        if(mCurrentFrame.GetNavState().Get_dBias_Gyr().norm() > 1e-6) cerr<<"PredictNavStateByIMU2 current Frame dBias gyr not zero"<<endl;
+    }
+}
+
+bool Tracking::TrackWithIMU(bool bMapUpdated) {
+    ORBmatcher matcher(0.9, true);
+
+    if(!mpLocalMapper->GetVINSInited()) cerr<<"local mapping VINS not inited. why call TrackWithIMU?"<<endl;
+
+    PredictNavStateByIMU(bMapUpdated);
+
+    fill(mCurrentFrame.mvpMapPoints.begin(), mCurrentFrame.mvpMapPoints.end(), static_cast<MapPoint*>(NULL));
+
+    int th;
+    if (mSensor != System::STEREO)
+        th = 15;
+    else
+        th = 7;
+
+    int nmatches = matcher.SearchByProjection(mCurrentFrame, mLastFrame, th, mSensor ==System::MONOCULAR);
+
+    if (nmatches < 20) {
+        fill(mCurrentFrame.mvpMapPoints.begin(), mCurrentFrame.mvpMapPoints.end(), static_cast<MapPoint*> (NULL));
+        nmatches = matcher.SearchByProjection(mCurrentFrame, mLastFrame, 2*th, mSensor == System::MONOCULAR);
+    }
+
+    if (nmatches < 10)
+        return false;
+
+    if (mpLocalMapper->GetFirstVINSInited() || bMapUpdated) {
+        Optimizer::PoseOptimization(&mCurrentFrame, mpLastKeyFrame, mIMUPreIntInTrack, mpLocalMapper->GetGravityVec(), false);
+    } else {
+        Optimizer::PoseOptimization(&mCurrentFrame, &mLastFrame, mIMUPreIntInTrack, mpLocalMapper->GetGravityVec(), false);
+    }
+
+    int nmatchesMap = 0;
+    for (int i = 0; i < mCurrentFrame.N; i++) {
+        if (mCurrentFrame.mvpMapPoints[i]) {
+            if (mCurrentFrame.mvbOutlier[i]) {
+                MapPoint* pMP = mCurrentFrame.mvpMapPoints[i];
+                mCurrentFrame.mvpMapPoints[i] = static_cast<MapPoint*>(NULL);
+                mCurrentFrame.mvbOutlier[i] = false;
+                pMP->mbTrackInView = false;
+                pMP->mnLastFrameSeen = mCurrentFrame.mnId;
+                nmatches--;
+            } else if (mCurrentFrame.mvpMapPoints[i]->Observations() >0) {
+                nmatchesMap++;
+            }
+        }
+    }
+
+    if (mbOnlyTracking) {
+        mbVO = nmatchesMap < 10;
+        return nmatches>20;
+    }
+
+    return nmatchesMap >= 6;
+}
+
+IMUPreintegrator Tracking::GetIMUPreIntSinceLastKF(Frame* pCurF, KeyFrame* pLastKF, const std::vector<IMUData>& vIMUSinceLastKF) {
+    IMUPreintegrator IMUPreInt;
+    IMUPreInt.reset();
+
+    Vector3d bg = pLastKF->GetNavState().Get_BiasGyr();
+    Vector3d ba = pLastKF->GetNavState().Get_BiasAcc();
+
+    const IMUData& imu = vIMUSinceLastKF.front();
+    double dt = imu._t - pLastKF->mTimeStamp;
+    IMUPreInt.update(imu._g - bg, imu._a - ba, dt);
+
+    for (size_t i = 0; i < vIMUSinceLastKF.size(); i++) {
+        const IMUData& imu = vIMUSinceLastKF[i];
+        double nextt;
+        if (i == vIMUSinceLastKF.size() - 1)
+            nextt = pCurF->mTimeStamp;
+        else
+            nextt = vIMUSinceLastKF[i+1]._t;
+
+        double dt = nextt - imu._t;
+        IMUPreInt.update(imu._g - bg, imu._a - ba, dt);
+    }
+
+    return IMUPreInt; 
+}
+
+IMUPreintegrator Tracking::GetIMUPreIntSinceLastFrame(Frame* pCurF, Frame* pLastF) {
+    IMUPreintegrator IMUPreInt;
+    IMUPreInt.reset();
+
+    pCurF->ComputeIMUPreIntSinceLastFrame(pLastF, IMUPreInt);
+    return IMUPreInt;
+}
+
+cv::Mat Tracking::GrabImageMonoVI(const cv::Mat &im, const std::vector<IMUData> & vimu, const double &timestamp) {
+    mvIMUSinceLastKF.insert(mvIMUSinceLastKF.end(), vimu.begin(), vimu.end());
+    mImGray = im;
+
+    if (mImGray.channels() == 3) {
+        if (mbRGB)
+            cvtColor(mImGray, mImGray, CV_RGB2GRAY);
+        else
+            cvtColor(mImGray, mImGray, CV_BGR2GRAY);
+    } else if (mImGray.channels() == 4) {
+        if (mbRGB)
+            cvtColor(mImGray, mImGray, CV_RGBA2GRAY);
+        else
+            cvtColor(mImGray, mImGray, CV_BGRA2GRAY);
+    }
+
+    if (mState == NOT_INITIALIZED || mState == NO_IMAGES_YET)
+        mCurrentFrame = Frame(mImGray, timestamp, vimu, mpIniORBextractor, mpORBVocabulary, mK, mDistCoef, mbf, mThDepth);
+    else
+        mCurrentFrame = Frame(mImGray, timestamp, vimu, mpORBextractorLeft, mpORBVocabulary, mK, mDistCoef, mbf, mThDepth, mpLastKeyFrame);
+
+    Track();
+    
+    return mCurrentFrame.mTcw.clone();
+}
+
 Tracking::Tracking(System *pSys, ORBVocabulary* pVoc, FrameDrawer *pFrameDrawer, MapDrawer *pMapDrawer, Map *pMap, KeyFrameDatabase* pKFDB, const string &strSettingPath, const int sensor):
     mState(NO_IMAGES_YET), mSensor(sensor), mbOnlyTracking(false), mbVO(false), mpORBVocabulary(pVoc),
     mpKeyFrameDB(pKFDB), mpInitializer(static_cast<Initializer*>(NULL)), mpSystem(pSys), mpViewer(NULL),
@@ -1239,8 +1558,8 @@ void Tracking::UpdateLocalKeyFrames()
             MapPoint* pMP = mCurrentFrame.mvpMapPoints[i];
             if(!pMP->isBad())
             {
-                const map<KeyFrame*,size_t> observations = pMP->GetObservations();
-                for(map<KeyFrame*,size_t>::const_iterator it=observations.begin(), itend=observations.end(); it!=itend; it++)
+                const mapMapPointObs/*map<KeyFrame*,size_t>*/ observations = pMP->GetObservations();
+                for(mapMapPointObs/*map<KeyFrame*,size_t>*/::const_iterator it=observations.begin(), itend=observations.end(); it!=itend; it++)
                     keyframeCounter[it->first]++;
             }
             else

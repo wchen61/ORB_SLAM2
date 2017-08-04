@@ -267,6 +267,44 @@ cv::Mat System::TrackMonocular(const cv::Mat &im, const double &timestamp)
     return Tcw;
 }
 
+cv::Mat System::TrackMonoVI(const cv::Mat &im, const std::vector<IMUData> &vimu, const double &timestamp)
+{
+    if (mSensor != MONOCULAR) {
+        cerr << "ERROR: you called TrackMonoVI but input sensor was not set to Monocular" << endl;
+        exit(-1);
+    }
+
+    {
+        unique_lock<mutex> lock(mMutexMode);
+        if (mbActivateLocalizationMode) {
+            mpLocalMapper->RequestStop();
+
+            while (!mpLocalMapper->isStopped()) {
+                usleep(1000);
+            }
+
+            mpTracker->InformOnlyTracking(true);
+            mbActivateLocalizationMode = false;
+        }
+
+        if (mbDeactivateLocalizationMode) {
+            mpTracker->InformOnlyTracking(false);
+            mpLocalMapper->Release();
+            mbDeactivateLocalizationMode = false;
+        }
+    }
+
+    {
+        unique_lock<mutex> lock(mMutexReset);
+        if (mbReset) {
+            mpTracker->Reset();
+            mbReset = false;
+        }
+    }
+
+    return mpTracker->GrabImageMonoVI(im, vimu, timestamp);
+}
+
 void System::ActivateLocalizationMode()
 {
     unique_lock<mutex> lock(mMutexMode);
