@@ -129,3 +129,7 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/Examples/Monocular)
 add_executable(mono_euroc_vins
 Examples/Monocular/mono_euroc_vins.cc)
 target_link_libraries(mono_euroc_vins ${PROJECT_NAME})
+
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/tools)
+add_executable(convert2bin tools/ConvertTxt2Bin.cpp)
+target_link_libraries(convert2bin ${PROJECT_NAME})
