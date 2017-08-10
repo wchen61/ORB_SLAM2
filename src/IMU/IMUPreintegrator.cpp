@@ -1,4 +1,5 @@
 #include "IMU/IMUPreintegrator.h"
+#include <iostream>
 
 namespace ORB_SLAM2
 {
@@ -116,6 +117,8 @@ void IMUPreintegrator::update(const Vector3d& omega, const Vector3d& acc, const 
     _delta_P += _delta_V*dt + 0.5*_delta_R*acc*dt2;    // P_k+1 = P_k + V_k*dt + R_k*a_k*dt*dt/2
     _delta_V += _delta_R*acc*dt;
     _delta_R = normalizeRotationM(_delta_R*dR);  // normalize rotation, in case of numerical error accumulation
+
+    //std::cout << "update:" << std::fixed << _delta_P.transpose() << std::endl;
 
 
 //    // noise covariance propagation of delta measurements

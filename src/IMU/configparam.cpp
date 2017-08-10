@@ -14,6 +14,7 @@ bool ConfigParam::_bAccMultiply9p8 = false;
 std::string ConfigParam::_tmpFilePath = "";
 double ConfigParam::_nVINSInitTime = 15;
 bool ConfigParam::_bRealTime = true;
+bool ConfigParam::_bUseIMU = false;
 
 ConfigParam::ConfigParam(std::string configfile)
 {
@@ -82,6 +83,12 @@ ConfigParam::ConfigParam(std::string configfile)
         int tmpBool = fSettings["test.RealTime"];
         _bRealTime = (tmpBool != 0);
         std::cout<<"whether run realtime? 0/1: "<<_bRealTime<<std::endl;
+    }
+
+    {
+        int tmpbUseIMU = fSettings["bUseIMU"];
+        _bUseIMU = (tmpbUseIMU != 0);
+        std::cout << "whether use IMU 0/1: " << _bUseIMU << std::endl;
     }
 }
 

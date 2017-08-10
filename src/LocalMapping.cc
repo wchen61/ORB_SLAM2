@@ -166,6 +166,7 @@ void LocalMapping::VINSInitThread()
     cerr<<"start VINSInitThread"<<endl;
     while(1)
     {
+        //cerr<<"VINSInitThread frame next id: " << KeyFrame::nNextId << " mnID: " << mpCurrentKeyFrame <<endl;
         if(KeyFrame::nNextId > 2)
             if(!GetVINSInited() && mpCurrentKeyFrame->mnId > initedid)
             {
@@ -268,6 +269,7 @@ bool LocalMapping::TryInitVIO(void)
     Vector3d bgest = Optimizer::OptimizeInitialGyroBias(vTwc,vIMUPreInt);
     //Vector3d bgest = Optimizer::OptimizeInitialGyroBias(vScaleGravityKF);
 
+    //cout << " Try init VIO bgest: " << bgest.transpose() << endl;
     // Update biasg and pre-integration in LocalWindow. Remember to reset back to zero
     for(int i=0;i<N;i++)
     {
@@ -466,6 +468,8 @@ bool LocalMapping::TryInitVIO(void)
     cv::Mat dbiasa_ = y.rowRange(3,6);
     Vector3d dbiasa_eig = Converter::toVector3d(dbiasa_);
 
+    //cout << "tryInit VIO s_: " << fixed << s_ << " gw: " << gwstar.t() << "bias a " << dbiasa_eig.transpose() << endl;
+
     // dtheta = [dx;dy;0]
     cv::Mat dtheta = cv::Mat::zeros(3,1,CV_32F);
     dthetaxy.copyTo(dtheta.rowRange(0,2));
@@ -530,6 +534,7 @@ bool LocalMapping::TryInitVIO(void)
         mGravityVec = gw.clone();
         Vector3d gweig = Converter::toVector3d(gw);
         mRwiInit = Rwi_.clone();
+        //cout << "bVIOInited success, scale: " << s_ << " gravity: " << gw << " g : " << gweig << " gnorm: "<< gweig.norm() << endl;
 
         // Update NavState for the KeyFrames not in vScaleGravityKF
         // Update Tcw-type pose for these KeyFrames, need mutex lock
@@ -893,11 +898,20 @@ void LocalMapping::DeleteBadInLocalWindow(void)
 //-------------------------------------------------------------------------------------------
 //-------------------------------------------------------------------------------------------
 
-
 LocalMapping::LocalMapping(Map *pMap, const float bMonocular):
     mbMonocular(bMonocular), mbResetRequested(false), mbFinishRequested(false), mbFinished(true), mpMap(pMap),
     mbAbortBA(false), mbStopped(false), mbStopRequested(false), mbNotStop(false), mbAcceptKeyFrames(true)
 {
+    mnLocalWindowSize = ConfigParam::GetLocalWindowSize();
+    cout<<"mnLocalWindowSize:"<<mnLocalWindowSize<<endl;
+
+    mbVINSInited = false;
+    mbFirstTry = true;
+    mbFirstVINSInited = false;
+
+    mbUpdatingInitPoses = false;
+    mbCopyInitKFs = false;
+    mbInitGBAFinish = false;
 }
 
 void LocalMapping::SetLoopCloser(LoopClosing* pLoopCloser)
@@ -944,13 +958,43 @@ void LocalMapping::Run()
             {
                 // Local BA
                 if(mpMap->KeyFramesInMap()>2)
-                    Optimizer::LocalBundleAdjustment(mpCurrentKeyFrame,&mbAbortBA, mpMap);
+                {
+                    if(!GetVINSInited())
+                    {
+                        //Optimizer::LocalBundleAdjustment(mpCurrentKeyFrame,mlLocalKeyFrames,&mbAbortBA, mpMap, this);
+                        Optimizer::LocalBundleAdjustment(mpCurrentKeyFrame,&mbAbortBA,mpMap,this);
+                    }
+                    else
+                    {
+                        //Optimizer::LocalBundleAdjustmentNavStatePRV(mpCurrentKeyFrame,mlLocalKeyFrames,&mbAbortBA, mpMap, mGravityVec, this);
+                        Optimizer::LocalBAPRVIDP(mpCurrentKeyFrame,mlLocalKeyFrames,&mbAbortBA, mpMap, mGravityVec, this);
+                    }
+                }
+
+                // Visual-Inertial initialization for non-realtime mode
+                if(!ConfigParam::GetRealTimeFlag())
+                {
+                    // Try to initialize VIO, if not inited
+                    if(!GetVINSInited())
+                    {
+                        bool tmpbool = TryInitVIO();
+                        SetVINSInited(tmpbool);
+                        if(tmpbool)
+                        {
+                            // Update map scale
+                            mpMap->UpdateScale(mnVINSInitScale);
+                            // Set initialization flag
+                            SetFirstVINSInited(true);
+                        }
+                    }
+                }
 
                 // Check redundant local Keyframes
                 KeyFrameCulling();
             }
 
-            mpLoopCloser->InsertKeyFrame(mpCurrentKeyFrame);
+            if(GetFlagInitGBAFinish())
+                mpLoopCloser->InsertKeyFrame(mpCurrentKeyFrame);
         }
         else if(Stop())
         {
@@ -1028,6 +1072,11 @@ void LocalMapping::ProcessNewKeyFrame()
 
     // Update links in the Covisibility Graph
     mpCurrentKeyFrame->UpdateConnections();
+
+    // Delete bad KF in LocalWindow
+    DeleteBadInLocalWindow();
+    // Add Keyframe to LocalWindow
+    AddToLocalWindow(mpCurrentKeyFrame);
 
     // Insert Keyframe in Map
     mpMap->AddKeyFrame(mpCurrentKeyFrame);
@@ -1497,17 +1546,64 @@ void LocalMapping::InterruptBA()
 
 void LocalMapping::KeyFrameCulling()
 {
+
+    if(ConfigParam::GetRealTimeFlag())
+    {
+        if(GetFlagCopyInitKFs())
+            return;
+    }
+    SetFlagCopyInitKFs(true);
+
     // Check redundant keyframes (only local keyframes)
     // A keyframe is considered redundant if the 90% of the MapPoints it sees, are seen
     // in at least other 3 keyframes (in the same or finer scale)
     // We only consider close stereo points
     vector<KeyFrame*> vpLocalKeyFrames = mpCurrentKeyFrame->GetVectorCovisibleKeyFrames();
 
+    KeyFrame* pOldestLocalKF = mlLocalKeyFrames.front();
+    KeyFrame* pPrevLocalKF = pOldestLocalKF->GetPrevKeyFrame();
+    KeyFrame* pNewestLocalKF = mlLocalKeyFrames.back();
+    // Test log
+    if(pOldestLocalKF->isBad()) cerr<<"pOldestLocalKF is bad, check 1. id: "<<pOldestLocalKF->mnId<<endl;
+    if(pPrevLocalKF) if(pPrevLocalKF->isBad()) cerr<<"pPrevLocalKF is bad, check 1. id: "<<pPrevLocalKF->mnId<<endl;
+    if(pNewestLocalKF->isBad()) cerr<<"pNewestLocalKF is bad, check 1. id: "<<pNewestLocalKF->mnId<<endl;
+
     for(vector<KeyFrame*>::iterator vit=vpLocalKeyFrames.begin(), vend=vpLocalKeyFrames.end(); vit!=vend; vit++)
     {
         KeyFrame* pKF = *vit;
         if(pKF->mnId==0)
             continue;
+
+        // Don't cull the oldest KF in LocalWindow,
+        // And the KF before this KF
+        if(pKF == pOldestLocalKF || pKF == pPrevLocalKF)
+            continue;
+
+        // Check time between Prev/Next Keyframe, if larger than 0.5s(for local)/3s(others), don't cull
+        // Note, the KF just out of Local is similarly considered as Local
+        KeyFrame* pPrevKF = pKF->GetPrevKeyFrame();
+        KeyFrame* pNextKF = pKF->GetNextKeyFrame();
+        if(pPrevKF && pNextKF && !GetVINSInited())
+        {
+            if(fabs(pNextKF->mTimeStamp - pPrevKF->mTimeStamp) > /*0.2*/0.5)
+                continue;
+        }
+        // Don't drop the KF before current KF
+        if(pKF->GetNextKeyFrame() == mpCurrentKeyFrame)
+            continue;
+        if(pKF->mTimeStamp >= mpCurrentKeyFrame->mTimeStamp - 0.11)
+            continue;
+
+        if(pPrevKF && pNextKF)
+        {
+            double timegap=0.51;
+            if(GetVINSInited() && pKF->mTimeStamp < mpCurrentKeyFrame->mTimeStamp - 4.0)
+                timegap = 3.01;
+
+            if(fabs(pNextKF->mTimeStamp - pPrevKF->mTimeStamp) > timegap)
+                continue;
+        }
+
         const vector<MapPoint*> vpMapPoints = pKF->GetMapPointMatches();
 
         int nObs = 3;
@@ -1559,6 +1655,8 @@ void LocalMapping::KeyFrameCulling()
         if(nRedundantObservations>0.9*nMPs)
             pKF->SetBadFlag();
     }
+
+    SetFlagCopyInitKFs(false);
 }
 
 cv::Mat LocalMapping::SkewSymmetricMatrix(const cv::Mat &v)
@@ -1594,6 +1692,12 @@ void LocalMapping::ResetIfRequested()
         mlNewKeyFrames.clear();
         mlpRecentAddedMapPoints.clear();
         mbResetRequested=false;
+    
+        mlLocalKeyFrames.clear();
+
+        // Add resetting init flags
+        mbVINSInited = false;
+        mbFirstTry = true;
     }
 }
 

@@ -35,6 +35,7 @@ public:
 
     static double GetVINSInitTime(){return _nVINSInitTime;}
     static bool GetRealTimeFlag() {return _bRealTime;}
+    static bool GetUseIMUFlag() { return _bUseIMU; }
 
 private:
     static Eigen::Matrix4d _EigTbc;
@@ -48,6 +49,7 @@ private:
     static double _g;
     static double _nVINSInitTime;
     static bool _bRealTime;
+    static bool _bUseIMU;
 };
 
 }

@@ -58,23 +58,29 @@ class Tracking
 public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
+    // Flags for relocalization. Create new KF once bias re-computed & flag for preparation for bias re-compute
     bool mbCreateNewKFAfterReloc;
     bool mbRelocBiasPrepare;
     void RecomputeIMUBiasAndCurrentNavstate(NavState& nscur);
+    // 20 Frames are used to compute bias
     vector<Frame> mv20FramesReloc;
 
+    // Predict the NavState of Current Frame by IMU
     void PredictNavStateByIMU(bool bMapUpdated);
     IMUPreintegrator mIMUPreIntInTrack;
-    
+
     bool TrackWithIMU(bool bMapUpdated=false);
     bool TrackLocalMapWithIMU(bool bMapUpdated=false);
 
     ConfigParam* mpParams;
     cv::Mat GrabImageMonoVI(const cv::Mat &im, const std::vector<IMUData> &vimu, const double &timestamp);
-
+    // IMU Data since last KF. Append when new data is provided
+    // Should be cleared in 1. initialization beginning, 2. new keyframe created.
     std::vector<IMUData> mvIMUSinceLastKF;
-    IMUPreintegrator GetIMUPreIntSinceLastKF(Frame* pCurF, KeyFrame* pLastKF, const std::vector<IMUData>& vIMUSinceLastKF);
+    IMUPreintegrator GetIMUPreIntSinceLastKF(Frame* pCurF, KeyFrame* pLastKF, const std::vector<IMUData>& vIMUSInceLastKF);
     IMUPreintegrator GetIMUPreIntSinceLastFrame(Frame* pCurF, Frame* pLastF);
+
+    bool mbUseIMU = false;
 
 public:
     Tracking(System* pSys, ORBVocabulary* pVoc, FrameDrawer* pFrameDrawer, MapDrawer* pMapDrawer, Map* pMap,
