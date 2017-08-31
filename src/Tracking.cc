@@ -34,7 +34,7 @@
 #include"PnPsolver.h"
 
 #include<iostream>
-
+#include <unistd.h>
 #include<mutex>
 
 using namespace std;
@@ -881,19 +881,19 @@ void Tracking::Track()
         if(!mbOnlyTracking)
         {
             if(bOK) {
-#ifndef TRACK_WITH_IMU
-                bOK = TrackLocalMap();
-#else
-                if (!mpLocalMapper->GetVINSInited()) {
+                if (!mbUseIMU) {
                     bOK = TrackLocalMap();
                 } else {
-                    if (mbRelocBiasPrepare) {
+                    if (!mpLocalMapper->GetVINSInited()) {
                         bOK = TrackLocalMap();
                     } else {
-                        bOK = TrackLocalMapWithIMU(bMapUpdated);
+                        if (mbRelocBiasPrepare) {
+                            bOK = TrackLocalMap();
+                        } else {
+                            bOK = TrackLocalMapWithIMU(bMapUpdated);
+                        }
                     }
                 }
-#endif
             }
         }
         else

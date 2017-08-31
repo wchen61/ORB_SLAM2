@@ -2032,7 +2032,7 @@ int Optimizer::PoseOptimization(Frame *pFrame, Frame* pLastFrame, const IMUPrein
         pFrame->mNavStatePrior = ns_recov;
 
         //Debug log
-        //cout<<"inv MargCov 2: "<<endl<<pFrame->mMargCovInv<<endl;
+        //cout<<"inv MargCov 2 for Frame: "<<endl<<pFrame->mMargCovInv<<endl;
     }
 
     //Test log

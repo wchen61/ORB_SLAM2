@@ -28,6 +28,8 @@
 
 #include<System.h>
 #include "IMU/imudata.h"
+#include <unistd.h>
+#include "sys/time.h"
 
 using namespace std;
 using namespace ORB_SLAM2;
@@ -98,6 +100,9 @@ int main(int argc, char **argv)
 
     // Main loop
     cv::Mat im;
+    uint32_t mBenchTime = 0;
+    uint32_t mCurrFrame = 0;
+
     for(int ni=imagestart; ni<nImages; ni++)
     {
         // Read image from file
@@ -136,6 +141,22 @@ int main(int argc, char **argv)
 #else
         std::chrono::monotonic_clock::time_point t2 = std::chrono::monotonic_clock::now();
 #endif
+        struct timeval tv;
+        uint32_t time, benchmark_interval = 5;
+
+        gettimeofday(&tv, NULL);
+        time = tv.tv_sec * 1000 + tv.tv_usec / 1000;
+        mCurrFrame++;
+        if (mCurrFrame == 0)
+            mBenchTime = time;
+        if (time - mBenchTime > (benchmark_interval * 1000)) {
+            printf("%d frames in %d seconds: %f fps\n",
+                    mCurrFrame,
+                    benchmark_interval,
+                    (float) mCurrFrame / benchmark_interval);
+            mBenchTime = time;
+            mCurrFrame = 0;
+        }
 
         double ttrack= std::chrono::duration_cast<std::chrono::duration<double> >(t2 - t1).count();
 
